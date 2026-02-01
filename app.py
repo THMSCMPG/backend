@@ -4,6 +4,7 @@ import time
 import base64
 import logging
 import numpy as np
+import threading
 import matplotlib
 matplotlib.use('Agg')  # Required for server-side rendering
 import matplotlib.pyplot as plt
@@ -338,29 +339,35 @@ def handle_simulation():
         }
     })
 
+def send_async_email(app, msg):
+    with app.app_context():
+        try:
+            mail.send(msg)
+            logger.info("Email sent successfully in background")
+        except Exception as e:
+            logger.error(f"Background Email Error: {e}")
+
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
 def handle_contact():
     if request.method == 'OPTIONS':
         return '', 204
         
     data = request.get_json()
+    # Honeypot check for bots
     if not data or data.get('website_hp'):
         return jsonify({"status": "success"}), 200
 
-    logger.info(f"Contact form submission from: {data.get('email')}")
+    msg = Message(
+        subject=f"Contact from {data.get('name')} - THMSCMPG Portfolio",
+        recipients=[CONTACT_RECIPIENT],
+        body=f"From: {data.get('name')} <{data.get('email')}>\n\nMessage:\n{data.get('message')}"
+    )
 
-    try:
-        msg = Message(
-            subject=f"Contact from {data.get('name')} - THMSCMPG Portfolio",
-            recipients=[CONTACT_RECIPIENT],
-            body=f"From: {data.get('name')} <{data.get('email')}>\n\nMessage:\n{data.get('message')}"
-        )
-        mail.send(msg)
-        logger.info("Email sent successfully")
-        return jsonify({"status": "success", "message": "Message sent!"})
-    except Exception as e:
-        logger.error(f"Contact Error: {e}")
-        return jsonify({"status": "error", "message": "Email service failed"}), 500
+    # FIXED: Start a background thread so the route returns immediately
+    thread = threading.Thread(target=send_async_email, args=(app, msg))
+    thread.start()
+
+    return jsonify({"status": "success", "message": "Message processing..."}), 200
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
