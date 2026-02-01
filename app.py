@@ -5,6 +5,7 @@ import base64
 import logging
 import numpy as np
 import threading
+import requests
 import matplotlib
 matplotlib.use('Agg')  # Required for server-side rendering
 import matplotlib.pyplot as plt
@@ -348,27 +349,51 @@ def send_async_email(app, msg):
         except Exception as e:
             logger.error(f"Background Email Error: {e}")
 
-@app.route('/api/contact', methods=['POST', 'OPTIONS'])
+@app.route('/api/contact', methods=['POST'])
 def handle_contact():
-    if request.method == 'OPTIONS':
-        return '', 204
+    data = request.json
+    logger.info(f"Contact form submission from: {data.get('email')}")
+
+    # Fire and forget (or run directly since it's fast)
+    success = send_via_formspree(data)
+    
+    if success:
+        return jsonify({"message": "Message received!"}), 200
+    else:
+        return jsonify({"message": "Failed to send message"}), 500
+
+FORMSPREE_URL = f"https://formspree.io/f/{os.environ.get('FORMSPREE_ID')}"
+def send_via_formspree(data):
+    """
+    Forwards the contact form data to Formspree via HTTPS.
+    Bypasses SMTP port issues entirely.
+    """
+    payload = {
+        "name": data.get("name"),
+        "email": data.get("email"),
+        "message": data.get("message"),
+        "_subject": f"Portfolio Contact from {data.get('name')}"
+    }
+    
+    try:
+        # Standard HTTPS call - Port 443 is never blocked by Render
+        response = requests.post(
+            FORMSPREE_URL,
+            data=payload,
+            headers={"Accept": "application/json"},
+            timeout=10
+        )
         
-    data = request.get_json()
-    # Honeypot check for bots
-    if not data or data.get('website_hp'):
-        return jsonify({"status": "success"}), 200
-
-    msg = Message(
-        subject=f"Contact from {data.get('name')} - THMSCMPG Portfolio",
-        recipients=[CONTACT_RECIPIENT],
-        body=f"From: {data.get('name')} <{data.get('email')}>\n\nMessage:\n{data.get('message')}"
-    )
-
-    # FIXED: Start a background thread so the route returns immediately
-    thread = threading.Thread(target=send_async_email, args=(app, msg))
-    thread.start()
-
-    return jsonify({"status": "success", "message": "Message processing..."}), 200
+        if response.ok:
+            logger.info("✅ Formspree accepted the message!")
+            return True
+        else:
+            logger.error(f"❌ Formspree Error: {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Connection to Formspree failed: {e}")
+        return False
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
