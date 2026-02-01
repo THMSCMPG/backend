@@ -24,18 +24,15 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# FIXED: Formspree configuration (Replaces SMTP)
+# Formspree configuration (set FORMSPREE_ID env var on Render)
 FORMSPREE_ID = os.environ.get("FORMSPREE_ID")
 FORMSPREE_URL = f"https://formspree.io/f/{FORMSPREE_ID}" if FORMSPREE_ID else None
 
-# FIXED: Updated CORS configuration
+# CORS: allow all three frontend origins + the bridge hub itself
 CORS(app, resources={
     r"/api/*": {
         "origins": [
-            "https://thmscmpg.github.io",
-            "https://thmscmpg.github.io/backend-hub",
-            "https://thmscmpg.github.io/CircuitNotes",
-            "https://thmscmpg.github.io/AURA-MF",
+            "https://thmscmpg.github.io",              # Portal + all sub-paths
             "http://localhost:4000",
             "http://127.0.0.1:4000",
             "http://localhost:8000",
@@ -67,30 +64,42 @@ class SimState:
 state_manager = SimState()
 
 class AURA_Physics_Solver:
-    SIGMA          = 5.67e-8   
-    RHO            = 2400.0    
-    CP             = 900.0     
-    H_BASE         = 10.0      
-    H_WIND         = 5.0       
-    T_SKY_OFFSET   = 10.0      
-    BETA           = 0.004     
-    T_REF          = 298.15    
+    """
+    2D finite-difference thermal solver for a photovoltaic panel.
+
+    Temperature unit contract:
+      - Input  `ambient`: KELVIN  (frontend slider range 280–330 K)
+      - Internal field `self.T`: KELVIN
+      - Output stats: CELSIUS (converted at the API response boundary)
+    """
+    SIGMA          = 5.67e-8   # Stefan-Boltzmann constant [W/m²·K⁴]
+    RHO            = 2400.0    # Density [kg/m³]
+    CP             = 900.0     # Specific heat [J/(kg·K)]
+    H_BASE         = 10.0      # Base convective coefficient [W/(m²·K)]
+    H_WIND         = 5.0       # Wind-dependent convective increment
+    T_SKY_OFFSET   = 10.0      # Sky temperature offset below ambient [K]
+    BETA           = 0.004     # Temperature coefficient of efficiency [1/K]
+    T_REF          = 298.15    # Reference temperature [K]
 
     def __init__(self, nx=20, ny=20):
         self.nx, self.ny = nx, ny
-        self.dx = 0.1                               
-        self.T  = np.ones((ny, nx)) * self.T_REF   
+        self.dx = 0.1                               # Grid spacing [m]
+        self.T  = np.ones((ny, nx)) * self.T_REF    # Initial field [K]
 
     def solve(self, solar, wind, ambient, fidelity,
               cell_efficiency, thermal_conductivity, absorptivity, emissivity):
+        """
+        Advance the temperature field through `steps` sub-iterations.
+        `ambient` is in KELVIN.
+        """
         steps = [5, 20, 100][fidelity]
-        dt    = 0.1   
+        dt    = 0.1   # Sub-step size [s]
         h_conv = self.H_BASE + self.H_WIND * wind
         alpha_th = thermal_conductivity / (self.RHO * self.CP)
         q_abs = absorptivity * solar
         q_elec = cell_efficiency * q_abs
         q_thermal = q_abs - q_elec
-        T_sky = ambient - self.T_SKY_OFFSET
+        T_sky = ambient - self.T_SKY_OFFSET   # Sky radiative sink [K]
         scale = dt / (self.RHO * self.CP * self.dx)
 
         for _ in range(steps):
@@ -143,23 +152,24 @@ def handle_simulation():
     t_start = time.time()
     data = request.json if request.is_json else {} if request.method == 'POST' else {}
     
-    # FIXED: Parameter extraction with proper defaults
-    solar = float(np.clip(float(data.get('solar', 1000.0)), 800.0, 1200.0))
-    wind = float(np.clip(float(data.get('wind', 2.0)), 0.0, 10.0))
-    # CRITICAL FIX: Ambient temperature is now expected in Kelvin from frontend
-    ambient = float(np.clip(float(data.get('ambient', 298.15)), 280.0, 330.0))
-    cell_efficiency = float(np.clip(float(data.get('cell_efficiency', 0.20)), 0.10, 0.30))
+    # Parameter extraction with clipping to valid ranges.
+    # ambient is expected in KELVIN from the frontend (slider range 280–330).
+    solar                = float(np.clip(float(data.get('solar', 1000.0)), 800.0, 1200.0))
+    wind                 = float(np.clip(float(data.get('wind', 2.0)), 0.0, 10.0))
+    ambient              = float(np.clip(float(data.get('ambient', 298.15)), 280.0, 330.0))  # Kelvin
+    cell_efficiency      = float(np.clip(float(data.get('cell_efficiency', 0.20)), 0.10, 0.30))
     thermal_conductivity = float(np.clip(float(data.get('thermal_conductivity', 130.0)), 100.0, 200.0))
-    absorptivity = float(np.clip(float(data.get('absorptivity', 0.95)), 0.85, 0.98))
-    emissivity = float(np.clip(float(data.get('emissivity', 0.90)), 0.80, 0.95))
+    absorptivity         = float(np.clip(float(data.get('absorptivity', 0.95)), 0.85, 0.98))
+    emissivity           = float(np.clip(float(data.get('emissivity', 0.90)), 0.80, 0.95))
 
     current_fid = state_manager.step()
     solver = AURA_Physics_Solver()
-    result_field = solver.solve(solar, wind, ambient, current_fid, cell_efficiency, thermal_conductivity, absorptivity, emissivity)
+    result_field = solver.solve(solar, wind, ambient, current_fid,
+                                cell_efficiency, thermal_conductivity, absorptivity, emissivity)
     power_total, eff_avg = solver.compute_power_metrics(solar, cell_efficiency, absorptivity)
     runtime_ms = (time.time() - t_start) * 1000.0
 
-    # CRITICAL FIX: Return properly structured response matching frontend expectations
+    # Response: temperature_field is in Kelvin; stats are converted to Celsius here.
     return jsonify({
         "temperature_field": result_field.tolist(),
         "visualization": generate_plot(result_field),
@@ -169,25 +179,26 @@ def handle_simulation():
         "energy_residuals": [1e-3, 1e-5, 1e-8][current_fid],
         "timestamp": state_manager.time,
         "stats": {
-            # Temperature values in Celsius for display
-            "max_t": round(float(np.max(result_field)) - 273.15, 2),
-            "min_t": round(float(np.min(result_field)) - 273.15, 2),
-            "avg_t": round(float(np.mean(result_field)) - 273.15, 2),
+            # All temperature values converted to Celsius for frontend display
+            "max_t":      round(float(np.max(result_field)) - 273.15, 2),
+            "min_t":      round(float(np.min(result_field)) - 273.15, 2),
+            "avg_t":      round(float(np.mean(result_field)) - 273.15, 2),
             "power_total": round(power_total, 2),
-            "eff_avg": round(eff_avg * 100, 2),
+            "eff_avg":    round(eff_avg * 100, 2),
             "runtime_ms": round(runtime_ms, 1)
         }
     })
 
-# FIXED: Integrated Formspree logic into the contact route
+# ─── Contact Form ───────────────────────────────────────────────────────────
+
 def send_via_formspree(data):
     if not FORMSPREE_URL:
         logger.error("❌ FORMSPREE_ID not found in environment variables")
         return False
     
     payload = {
-        "name": data.get("name"),
-        "email": data.get("email"),
+        "name":     data.get("name"),
+        "email":    data.get("email"),
         "message": data.get("message"),
         "_subject": f"Portfolio Contact from {data.get('name', 'Anonymous')}"
     }
@@ -209,7 +220,15 @@ def handle_contact():
     if request.method == 'OPTIONS':
         return '', 204
     
-    data = request.json
+    data = request.json or {}
+
+    # Server-side honeypot check: if website_hp is present and non-empty,
+    # silently discard the submission (do not tell the bot it failed).
+    if data.get('website_hp', '').strip():
+        logger.warning(f"🚫 Honeypot triggered — discarding submission from {data.get('email', 'unknown')}")
+        # Return 200 to not reveal to bots that filtering occurred
+        return jsonify({"message": "Message received!"}), 200
+
     logger.info(f"Contact form submission from: {data.get('email')}")
     
     success = send_via_formspree(data)
@@ -219,15 +238,19 @@ def handle_contact():
     else:
         return jsonify({"message": "Failed to send message via provider"}), 500
 
+# ─── Health Check ───────────────────────────────────────────────────────────
+
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
     if request.method == 'OPTIONS':
         return '', 204
     return jsonify({
         "status": "active", 
-        "version": "1.2.0",
+        "version": "1.3.0",
         "timestamp": datetime.now().isoformat()
     })
+
+# ─── Root Docs Page ─────────────────────────────────────────────────────────
 
 @app.route('/')
 def docs():
@@ -246,11 +269,13 @@ def docs():
             <h1>🚀 AURA-MF Backend API</h1>
             <div class="status">✅ Status: <strong>Running</strong><br>🕐 Uptime: {{ time }} simulation steps</div>
             <h2>Endpoints</h2>
-            <div class="endpoint">GET /api/health - Health check</div>
-            <div class="endpoint">POST /api/contact - Contact form (via Formspree)</div>
-            <div class="endpoint">GET/POST /api/simulate - Physics simulation</div>
+            <div class="endpoint">GET /api/health — Health check</div>
+            <div class="endpoint">POST /api/contact — Contact form (via Formspree, honeypot-protected)</div>
+            <div class="endpoint">GET/POST /api/simulate — Physics simulation</div>
         </div></body></html>
     """, time=state_manager.time)
+
+# ─── CORS After-Request Hook ────────────────────────────────────────────────
 
 @app.after_request
 def after_request(response):
