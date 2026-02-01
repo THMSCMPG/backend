@@ -47,8 +47,9 @@ CORS(app, resources={
 # SMTP Setup
 app.config.update(
     MAIL_SERVER='smtp.gmail.com',
-    MAIL_PORT=587,
-    MAIL_USE_TLS=True,
+    MAIL_PORT=465,         # Change from 587
+    MAIL_USE_SSL=True,      # Change from False/None
+    MAIL_USE_TLS=False,     # Change from True
     MAIL_USERNAME=os.environ.get("MAIL_USERNAME"),
     MAIL_PASSWORD=os.environ.get("MAIL_PASSWORD"),
     MAIL_DEFAULT_SENDER=os.environ.get("MAIL_USERNAME")
