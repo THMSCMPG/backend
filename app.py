@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# FIXED: Updated CORS configuration with all required headers and origins
 CORS(app, resources={
     r"/api/*": {
         "origins": [
@@ -31,11 +32,14 @@ CORS(app, resources={
             "https://thmscmpg.github.io/CircuitNotes",
             "https://thmscmpg.github.io/AURA-MF",
             "http://localhost:4000",
-            "http://127.0.0.1:4000"
+            "http://127.0.0.1:4000",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000"
         ],
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-        "supports_credentials": False
+        "allow_headers": ["Content-Type", "Accept"],
+        "supports_credentials": False,
+        "expose_headers": ["Content-Type"]
     }
 })
     
@@ -196,50 +200,54 @@ class AURA_Physics_Solver:
             q_net  = q_thermal - q_conv - q_rad + q_cond
             self.T = self.T + q_net * scale
 
-        # Clamp to physically plausible range
-        self.T = np.clip(self.T, 250.0, 400.0)
         return self.T
 
     def compute_power_metrics(self, solar, cell_efficiency, absorptivity):
         """
-        Post-solve electrical output using linear temperature derating.
-
-        Per-cell derated efficiency:
-            η(T) = η_e · max(0,  1 − β · (T − T_ref))
-
-        Per-cell power:
-            P_cell = η(T) · α_s · G · dx²
+        Compute instantaneous power output and efficiency at current T field.
 
         Returns
         -------
-        power_total   float   total panel power           [W]
-        eff_avg       float   mean derated efficiency     [–]  (0–1 range)
+        power_total  float   total electrical power [W]
+        eff_avg      float   effective PV efficiency [–] (accounting for T derating)
         """
-        q_abs = absorptivity * solar                  # absorbed irradiance [W/m²]
+        # Absorbed solar flux per cell: Q_abs = α_s · G  [W/m²]
+        q_abs = absorptivity * solar
 
-        # Per-cell derated efficiency (clamped ≥ 0)
-        eta_local = cell_efficiency * np.maximum(
-            0.0,
-            1.0 - self.BETA * (self.T - self.T_REF)
-        )
+        # Electrical conversion: η_e(T) = η_ref · [1 − β·(T − T_ref)]
+        eta_local = cell_efficiency * (1.0 - self.BETA * (self.T - self.T_REF))
 
-        eff_avg     = float(np.mean(eta_local))
-        cell_area   = self.dx ** 2                    # [m²]
-        power_total = float(np.sum(eta_local * q_abs * cell_area))
+        # Clip to ensure η ≥ 0 (high temps → some cells might turn off)
+        eta_local = np.maximum(eta_local, 0.0)
+
+        # Power per cell: P = Q_abs · η_e(T)   [W/m²]
+        power_density = q_abs * eta_local
+
+        # Panel area:  A_cell = dx · dx   [m²]
+        A_cell = self.dx * self.dx
+
+        # Total power over entire panel:
+        power_total = float(np.sum(power_density) * A_cell)  # [W]
+
+        # Average effective efficiency (domain-averaged):
+        eff_avg = float(np.mean(eta_local))
 
         return power_total, eff_avg
 
 
-# ============================================================================
-# VISUALIZATION UTILITY
-# ============================================================================
-
-def generate_plot(temp_data):
-    """Generates a heatmap and returns it as a Base64 string."""
-    plt.figure(figsize=(5, 4))
-    plt.imshow(temp_data - 273.15, cmap='magma', origin='lower')
-    plt.colorbar(label='Temp (°C)')
-    plt.title("AURA-MF Thermal Field")
+def generate_plot(temperature_field):
+    """Generate base64-encoded heatmap of temperature field."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    
+    # Convert Kelvin to Celsius for display
+    temp_celsius = temperature_field - 273.15
+    
+    im = ax.imshow(temp_celsius, cmap='hot', origin='lower', interpolation='bilinear')
+    ax.set_title('PV Panel Temperature Distribution', fontsize=14, weight='bold')
+    ax.set_xlabel('Position (grid cells)')
+    ax.set_ylabel('Position (grid cells)')
+    
+    cbar = plt.colorbar(im, ax=ax, label='Temperature (°C)')
     
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight')
@@ -250,6 +258,7 @@ def generate_plot(temp_data):
 # API ROUTES
 # ============================================================================
 
+# FIXED: Now accepts both GET and POST methods
 @app.route('/api/simulate', methods=['GET', 'POST', 'OPTIONS'])
 def handle_simulation():
     if request.method == 'OPTIONS':
@@ -257,9 +266,15 @@ def handle_simulation():
 
     t_start = time.time()
 
-    # ---- read all 7 parameters with defaults matching the slider defaults --
-    data = request.json if request.is_json else {}
+    # FIXED: Handle both GET (dashboard auto-update) and POST (user-triggered)
+    if request.method == 'GET':
+        # Dashboard auto-update with default parameters
+        data = {}
+    else:
+        # User-triggered simulation with custom parameters
+        data = request.json if request.is_json else {}
 
+    # ---- read all 7 parameters with defaults matching the slider defaults --
     solar                = float(data.get('solar',                1000.0))
     wind                 = float(data.get('wind',                 2.0   ))
     ambient              = float(data.get('ambient',              298.15))
@@ -409,7 +424,7 @@ def docs():
                 <h2>Available Endpoints</h2>
                 <div class="endpoint">GET /api/health - Health check</div>
                 <div class="endpoint">POST /api/contact - Contact form submission</div>
-                <div class="endpoint">POST /api/simulate - Physics simulation</div>
+                <div class="endpoint">GET/POST /api/simulate - Physics simulation</div>
                 
                 <h2>Frontend Sites</h2>
                 <p>
@@ -431,7 +446,7 @@ def after_request(response):
     origin = request.headers.get('Origin')
     if origin and origin.startswith('https://thmscmpg.github.io'):
         response.headers.add('Access-Control-Allow-Origin', origin)
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Accept')
         response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     return response
 
