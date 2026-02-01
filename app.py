@@ -11,7 +11,6 @@ matplotlib.use('Agg')  # Required for server-side rendering
 import matplotlib.pyplot as plt
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-# Removed flask_mail imports as they are blocked by Render
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Tuple
@@ -50,7 +49,7 @@ CORS(app, resources={
 })
 
 # ============================================================================
-# PHYSICS & SIMULATION ENGINE (UNTOUCHED)
+# PHYSICS & SIMULATION ENGINE
 # ============================================================================
 
 @dataclass
@@ -144,8 +143,10 @@ def handle_simulation():
     t_start = time.time()
     data = request.json if request.is_json else {} if request.method == 'POST' else {}
     
+    # FIXED: Parameter extraction with proper defaults
     solar = float(np.clip(float(data.get('solar', 1000.0)), 800.0, 1200.0))
     wind = float(np.clip(float(data.get('wind', 2.0)), 0.0, 10.0))
+    # CRITICAL FIX: Ambient temperature is now expected in Kelvin from frontend
     ambient = float(np.clip(float(data.get('ambient', 298.15)), 280.0, 330.0))
     cell_efficiency = float(np.clip(float(data.get('cell_efficiency', 0.20)), 0.10, 0.30))
     thermal_conductivity = float(np.clip(float(data.get('thermal_conductivity', 130.0)), 100.0, 200.0))
@@ -158,6 +159,7 @@ def handle_simulation():
     power_total, eff_avg = solver.compute_power_metrics(solar, cell_efficiency, absorptivity)
     runtime_ms = (time.time() - t_start) * 1000.0
 
+    # CRITICAL FIX: Return properly structured response matching frontend expectations
     return jsonify({
         "temperature_field": result_field.tolist(),
         "visualization": generate_plot(result_field),
@@ -167,6 +169,7 @@ def handle_simulation():
         "energy_residuals": [1e-3, 1e-5, 1e-8][current_fid],
         "timestamp": state_manager.time,
         "stats": {
+            # Temperature values in Celsius for display
             "max_t": round(float(np.max(result_field)) - 273.15, 2),
             "min_t": round(float(np.min(result_field)) - 273.15, 2),
             "avg_t": round(float(np.mean(result_field)) - 273.15, 2),
@@ -190,7 +193,6 @@ def send_via_formspree(data):
     }
     
     try:
-        # standard HTTPS call (Port 443) bypasses Render's SMTP block
         response = requests.post(
             FORMSPREE_URL,
             json=payload,
@@ -223,7 +225,7 @@ def health():
         return '', 204
     return jsonify({
         "status": "active", 
-        "version": "1.1.0",
+        "version": "1.2.0",
         "timestamp": datetime.now().isoformat()
     })
 
