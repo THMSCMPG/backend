@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import base64
 import logging
 import numpy as np
@@ -70,47 +71,164 @@ class SimState:
 
 state_manager = SimState()
 
+
 class AURA_Physics_Solver:
-    """2D Thermal Finite Difference Solver."""
-    SIGMA = 5.67e-8  # Stefan-Boltzmann
-    
+    """
+    2D Thermal Finite-Difference Solver for a photovoltaic panel.
+
+    Energy balance per grid cell per timestep
+    ------------------------------------------
+        Q_abs     = alpha_s * G                         [W/m²]  absorbed solar
+        Q_elec    = eta_e * Q_abs                       [W/m²]  extracted as electricity
+        Q_thermal = Q_abs - Q_elec                      [W/m²]  remainder heats the cell
+        Q_conv    = h_conv * (T - T_inf)                [W/m²]  convective loss
+        Q_rad     = eps * sigma * (T⁴ - T_sky⁴)        [W/m²]  radiative loss
+        Q_cond    = alpha_th * laplacian(T)             [W/m²]  lateral conduction
+
+        dT = (Q_thermal - Q_conv - Q_rad + Q_cond) * dt * scale
+
+    Seven user-controllable parameters (one per frontend slider)
+    -------------------------------------------------------------
+        G           solar irradiance       [W/m²]   800–1200
+        T_inf       ambient temperature    [K]      280–330
+        u           wind speed             [m/s]    0–10
+        eta_e       cell efficiency        [–]      0.10–0.30
+        k           thermal conductivity   [W/(m·K)] 100–200
+        alpha_s     solar absorptivity     [–]      0.85–0.98
+        eps         surface emissivity     [–]      0.80–0.95
+
+    Fixed material / correlation constants
+    ---------------------------------------
+        SIGMA    5.67e-8   Stefan-Boltzmann [W/(m²·K⁴)]
+        RHO      2400      density of PV laminate [kg/m³]
+        CP       900       specific heat [J/(kg·K)]
+        H_BASE   10        natural-convection baseline [W/(m²·K)]
+        H_WIND   5         forced-convection scaling per m/s [W/(m²·K·s/m)]
+        T_SKY_OFFSET  10   clear-sky approximation: T_sky = T_inf − 10 K
+        BETA     0.004     linear power derating coeff [1/K] (standard Si cell)
+        T_REF    298.15    IEC reference temperature [K] (25 °C)
+    """
+
+    SIGMA          = 5.67e-8   # Stefan-Boltzmann constant
+    RHO            = 2400.0    # laminate density          [kg/m³]
+    CP             = 900.0     # specific heat             [J/(kg·K)]
+    H_BASE         = 10.0      # natural-convection base   [W/(m²·K)]
+    H_WIND         = 5.0       # forced-convection scale   [W/(m²·K) per m/s]
+    T_SKY_OFFSET   = 10.0      # T_sky = T_inf - this      [K]
+    BETA           = 0.004     # power derating coeff      [1/K]
+    T_REF          = 298.15    # reference temperature     [K]
+
     def __init__(self, nx=20, ny=20):
         self.nx, self.ny = nx, ny
-        self.dx = 0.1 # meters
-        self.T = np.ones((ny, nx)) * 298.15 # Start at 25°C
+        self.dx = 0.1                              # grid spacing [m]
+        self.T  = np.ones((ny, nx)) * self.T_REF   # start at 25 °C
 
-    def solve(self, solar, wind, ambient, fidelity):
+    def solve(self, solar, wind, ambient, fidelity,
+              cell_efficiency, thermal_conductivity, absorptivity, emissivity):
         """
-        Runs a simplified heat balance: 
-        dT/dt = (Q_solar - Q_conv - Q_rad + Q_cond) / (m * Cp)
+        Explicit finite-difference time loop.
+
+        Parameters
+        ----------
+        solar               float   irradiance G            [W/m²]
+        wind                float   wind speed u            [m/s]
+        ambient             float   ambient temp T_inf      [K]
+        fidelity            int     0=LF / 1=MF / 2=HF     controls step count
+        cell_efficiency     float   electrical η_e          [–]
+        thermal_conductivity float  in-plane k              [W/(m·K)]
+        absorptivity        float   solar α_s               [–]
+        emissivity          float   surface ε               [–]
+
+        Returns
+        -------
+        self.T   ndarray   final temperature field         [K]
         """
-        # Multi-fidelity resolution scaling
-        steps = [5, 20, 100][fidelity] 
-        dt = 0.1
-        
-        # Physical constants
-        h_conv = 10.0 + (5.0 * wind)
-        emissivity = 0.9
-        alpha = 1.3e-4 # Thermal diffusivity
-        
+        # --- fidelity → number of time steps --------------------------------
+        steps = [5, 20, 100][fidelity]
+        dt    = 0.1   # [s]
+
+        # --- derived quantities (computed once, outside the loop) -----------
+
+        # Convective transfer coefficient: h = h_base + h_wind · u
+        h_conv = self.H_BASE + self.H_WIND * wind
+
+        # Thermal diffusivity: α_th = k / (ρ · Cp)   [m²/s]
+        alpha_th = thermal_conductivity / (self.RHO * self.CP)
+
+        # Absorbed solar flux: Q_abs = α_s · G        [W/m²]
+        q_abs = absorptivity * solar
+
+        # Electrical extraction: Q_elec = η_e · Q_abs [W/m²]
+        q_elec = cell_efficiency * q_abs
+
+        # Net solar input to the thermal budget
+        q_thermal = q_abs - q_elec                    # [W/m²]
+
+        # Clear-sky temperature for radiative exchange
+        T_sky = ambient - self.T_SKY_OFFSET           # [K]
+
+        # Combined update scale: dt / (ρ · Cp · dx)
+        #   dx used as effective slab thickness (thin-panel limit)
+        scale = dt / (self.RHO * self.CP * self.dx)
+
+        # --- time loop ------------------------------------------------------
         for _ in range(steps):
-            # 1. Convection & Radiation
+
+            # 1. Convective loss
             q_conv = h_conv * (self.T - ambient)
-            q_rad = emissivity * self.SIGMA * (self.T**4 - (ambient-10)**4)
-            
-            # 2. Conduction (Laplacian)
-            T_pad = np.pad(self.T, 1, mode='edge')
-            laplacian = (T_pad[1:-1, 2:] + T_pad[1:-1, :-2] + 
-                         T_pad[2:, 1:-1] + T_pad[:-2, 1:-1] - 4*self.T) / self.dx**2
-            
-            # 3. Net Flux
-            # Q_solar is reduced by 20% efficiency (energy converted to electricity)
-            q_net = (solar * 0.8) - q_conv - q_rad + (alpha * laplacian)
-            
-            # 4. Update (Simplified mass/Cp factor)
-            self.T += q_net * dt * 0.001
-            
-        return np.clip(self.T, 250, 400)
+
+            # 2. Radiative loss  Q_rad = ε · σ · (T⁴ − T_sky⁴)
+            q_rad  = emissivity * self.SIGMA * (self.T**4 - T_sky**4)
+
+            # 3. Lateral conduction via 5-point Laplacian stencil
+            #    Neumann (zero-flux) boundary via edge-padding
+            T_pad     = np.pad(self.T, 1, mode='edge')
+            laplacian = (
+                T_pad[1:-1,  2:]   +   # east
+                T_pad[1:-1, :-2]   +   # west
+                T_pad[ 2:,  1:-1]  +   # south
+                T_pad[:-2,  1:-1]      # north
+                - 4.0 * self.T
+            ) / self.dx**2
+            q_cond = alpha_th * laplacian
+
+            # 4. Net flux → temperature update
+            q_net  = q_thermal - q_conv - q_rad + q_cond
+            self.T = self.T + q_net * scale
+
+        # Clamp to physically plausible range
+        self.T = np.clip(self.T, 250.0, 400.0)
+        return self.T
+
+    def compute_power_metrics(self, solar, cell_efficiency, absorptivity):
+        """
+        Post-solve electrical output using linear temperature derating.
+
+        Per-cell derated efficiency:
+            η(T) = η_e · max(0,  1 − β · (T − T_ref))
+
+        Per-cell power:
+            P_cell = η(T) · α_s · G · dx²
+
+        Returns
+        -------
+        power_total   float   total panel power           [W]
+        eff_avg       float   mean derated efficiency     [–]  (0–1 range)
+        """
+        q_abs = absorptivity * solar                  # absorbed irradiance [W/m²]
+
+        # Per-cell derated efficiency (clamped ≥ 0)
+        eta_local = cell_efficiency * np.maximum(
+            0.0,
+            1.0 - self.BETA * (self.T - self.T_REF)
+        )
+
+        eff_avg     = float(np.mean(eta_local))
+        cell_area   = self.dx ** 2                    # [m²]
+        power_total = float(np.sum(eta_local * q_abs * cell_area))
+
+        return power_total, eff_avg
+
 
 # ============================================================================
 # VISUALIZATION UTILITY
@@ -134,52 +252,85 @@ def generate_plot(temp_data):
 
 @app.route('/api/simulate', methods=['GET', 'POST', 'OPTIONS'])
 def handle_simulation():
-    # Handle preflight
     if request.method == 'OPTIONS':
         return '', 204
-        
-    # 1. Get Inputs (Default or Request)
+
+    t_start = time.time()
+
+    # ---- read all 7 parameters with defaults matching the slider defaults --
     data = request.json if request.is_json else {}
-    solar = float(data.get('solar', 1000.0))
-    wind = float(data.get('wind', 2.0))
-    ambient = float(data.get('ambient', 298.15))
-    
-    logger.info(f"Simulation request: solar={solar}, wind={wind}, ambient={ambient}")
-    
-    # 2. Update Multi-Fidelity State
+
+    solar                = float(data.get('solar',                1000.0))
+    wind                 = float(data.get('wind',                 2.0   ))
+    ambient              = float(data.get('ambient',              298.15))
+    cell_efficiency      = float(data.get('cell_efficiency',      0.20  ))
+    thermal_conductivity = float(data.get('thermal_conductivity', 130.0 ))
+    absorptivity         = float(data.get('absorptivity',         0.95  ))
+    emissivity           = float(data.get('emissivity',           0.90  ))
+
+    # ---- clamp every value to its slider's physical range -------------------
+    solar                = float(np.clip(solar,                800.0,  1200.0))
+    wind                 = float(np.clip(wind,                 0.0,    10.0  ))
+    ambient              = float(np.clip(ambient,              280.0,  330.0 ))
+    cell_efficiency      = float(np.clip(cell_efficiency,      0.10,   0.30  ))
+    thermal_conductivity = float(np.clip(thermal_conductivity, 100.0,  200.0 ))
+    absorptivity         = float(np.clip(absorptivity,         0.85,   0.98  ))
+    emissivity           = float(np.clip(emissivity,           0.80,   0.95  ))
+
+    logger.info(
+        f"Simulation: solar={solar} wind={wind} ambient={ambient} "
+        f"eta_e={cell_efficiency} k={thermal_conductivity} "
+        f"alpha_s={absorptivity} eps={emissivity}"
+    )
+
+    # ---- multi-fidelity state tick ------------------------------------------
     current_fid = state_manager.step()
-    
-    # 3. Run Solver
-    solver = AURA_Physics_Solver()
-    result_field = solver.solve(solar, wind, ambient, current_fid)
-    
-    # 4. Generate Analytics
+
+    # ---- run solver ---------------------------------------------------------
+    solver       = AURA_Physics_Solver()
+    result_field = solver.solve(
+        solar, wind, ambient, current_fid,
+        cell_efficiency, thermal_conductivity, absorptivity, emissivity
+    )
+
+    # ---- post-solve power metrics ------------------------------------------
+    power_total, eff_avg = solver.compute_power_metrics(
+        solar, cell_efficiency, absorptivity
+    )
+
+    # ---- wall-clock runtime ------------------------------------------------
+    runtime_ms = (time.time() - t_start) * 1000.0
+
+    # ---- ML-orchestrator heuristics (demo) ---------------------------------
     confidence = 0.98 - (current_fid * 0.05) + (np.random.random() * 0.02)
-    residual = [1e-3, 1e-5, 1e-8][current_fid]
-    
+    residual   = [1e-3, 1e-5, 1e-8][current_fid]
+
     return jsonify({
         "temperature_field": result_field.tolist(),
-        "visualization": generate_plot(result_field),
-        "fidelity_level": current_fid,
-        "fidelity_name": ["Low (LF)", "Medium (MF)", "High (HF)"][current_fid],
-        "ml_confidence": round(confidence, 4),
-        "energy_residuals": residual,
-        "timestamp": state_manager.time,
+        "visualization":     generate_plot(result_field),
+        "fidelity_level":    current_fid,
+        "fidelity_name":     ["Low (LF)", "Medium (MF)", "High (HF)"][current_fid],
+        "ml_confidence":     round(confidence, 4),
+        "energy_residuals":  residual,
+        "timestamp":         state_manager.time,
         "stats": {
-            "max_t": round(np.max(result_field) - 273.15, 2),
-            "avg_t": round(np.mean(result_field) - 273.15, 2)
+            "max_t":      round(float(np.max(result_field))  - 273.15, 2),
+            "min_t":      round(float(np.min(result_field))  - 273.15, 2),
+            "avg_t":      round(float(np.mean(result_field)) - 273.15, 2),
+            "power_total": round(power_total, 2),       # [W]
+            "eff_avg":     round(eff_avg * 100, 2),     # converted to % for display
+            "runtime_ms":  round(runtime_ms, 1)         # [ms]
         }
     })
 
 @app.route('/api/contact', methods=['POST', 'OPTIONS'])
 def handle_contact():
-    # Handle preflight
     if request.method == 'OPTIONS':
         return '', 204
         
     data = request.get_json()
-    if not data or data.get('website_hp'): # Honeypot check
-        return jsonify({"status": "success"}), 200 # Silent drop for bots
+    if not data or data.get('website_hp'):
+        return jsonify({"status": "success"}), 200
 
     logger.info(f"Contact form submission from: {data.get('email')}")
 
@@ -198,7 +349,6 @@ def handle_contact():
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
-    # Handle preflight
     if request.method == 'OPTIONS':
         return '', 204
         
@@ -276,11 +426,9 @@ def docs():
         </html>
     """, time=state_manager.time)
 
-# Add CORS headers to all responses
 @app.after_request
 def after_request(response):
     origin = request.headers.get('Origin')
-    # Allow any thmscmpg.github.io subdomain
     if origin and origin.startswith('https://thmscmpg.github.io'):
         response.headers.add('Access-Control-Allow-Origin', origin)
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
