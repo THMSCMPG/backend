@@ -6,7 +6,7 @@ services:
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.14.0
       - key: ALLOWED_ORIGINS
         value: https://thmscmpg.github.io
       - key: MAX_GRID_SIZE

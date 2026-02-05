@@ -14,7 +14,6 @@ from flask_cors import CORS
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Tuple
-
 from physics import AURA_Physics_Solver, state_manager
 from physics import CoupledSolver, VisualizationGenerator, generate_plot
 
@@ -63,8 +62,7 @@ visualizer = VisualizationGenerator()
 @app.route('/api/simulate', methods=['GET', 'POST', 'OPTIONS'])
 def handle_simulation():
     """Original AURA-MF simulation endpoint (thermal only)"""
-    if request.method == 'OPTIONS':
-        return '', 204
+
     t_start = time.time()
     data = request.json if request.is_json else {} if request.method == 'POST' else {}
     
@@ -382,14 +380,6 @@ def docs():
 # CORS After-Request Hook
 # ──────────────────────────────────────────────────────────────────────
 
-@app.after_request
-def after_request(response):
-    origin = request.headers.get('Origin')
-    if origin and origin.startswith('https://thmscmpg.github.io'):
-        response.headers.add('Access-Control-Allow-Origin', origin)
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Accept')
-        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    return response
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
