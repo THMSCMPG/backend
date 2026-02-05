@@ -7,3 +7,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: ALLOWED_ORIGINS
+        value: https://thmscmpg.github.io
+      - key: MAX_GRID_SIZE
+        value: 100
+      - key: ENABLE_CACHING
+        value: true
+      - key: LOG_LEVEL
+        value: INFO
