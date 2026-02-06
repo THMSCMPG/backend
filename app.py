@@ -119,12 +119,8 @@ def handle_bte_ns_simulation():
         data = request.json or {}
         
         # Validate and extract parameters
-        fidelity_level = int(data.get('fidelity_level', 1))
-        if fidelity_level not in [0, 1, 2]:
-            return jsonify({
-                "success": False,
-                "error": "Invalid fidelity level. Must be 0, 1, or 2."
-            }), 400
+        raw_fidelity = data.get('fidelity_level')
+        fidelity_level = int(raw_fidelity) if raw_fidelity is not None else 1
         
         # Physics parameters
         solar_irradiance = float(np.clip(
