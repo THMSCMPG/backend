@@ -1,21 +1,9 @@
 import os
-import io
-import time
-import base64
 import logging
-import numpy as np
-import threading
 import requests
-import matplotlib
-matplotlib.use('Agg')  # Required for server-side rendering
-import matplotlib.pyplot as plt
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Tuple
-from physics import AURA_Physics_Solver, state_manager
-from physics import CoupledSolver, VisualizationGenerator, generate_plot
 
 
 # ============================================================================
@@ -50,193 +38,10 @@ CORS(app, resources={
     }
 })
 
-# Initialize coupled solver
-coupled_solver = CoupledSolver()
-visualizer = VisualizationGenerator()
-
 
 # ============================================================================
 # API ROUTES
 # ============================================================================
-
-@app.route('/api/simulate', methods=['GET', 'POST', 'OPTIONS'])
-def handle_simulation():
-    """Original AURA-MF simulation endpoint (thermal only)"""
-
-    t_start = time.time()
-    data = request.json if request.is_json else {} if request.method == 'POST' else {}
-    
-    # Parameter extraction with clipping to valid ranges.
-    # ambient is expected in KELVIN from the frontend (slider range 280–330).
-    solar                = float(np.clip(float(data.get('solar', 1000.0)), 800.0, 1200.0))
-    wind                 = float(np.clip(float(data.get('wind', 2.0)), 0.0, 10.0))
-    ambient              = float(np.clip(float(data.get('ambient', 298.15)), 280.0, 330.0))  # Kelvin
-    cell_efficiency      = float(np.clip(float(data.get('cell_efficiency', 0.20)), 0.10, 0.30))
-    thermal_conductivity = float(np.clip(float(data.get('thermal_conductivity', 130.0)), 100.0, 200.0))
-    absorptivity         = float(np.clip(float(data.get('absorptivity', 0.95)), 0.85, 0.98))
-    emissivity           = float(np.clip(float(data.get('emissivity', 0.90)), 0.80, 0.95))
-
-    current_fid = state_manager.step()
-    solver = AURA_Physics_Solver()
-    result_field = solver.solve(solar, wind, ambient, current_fid,
-                                cell_efficiency, thermal_conductivity, absorptivity, emissivity)
-    power_total, eff_avg = solver.compute_power_metrics(solar, cell_efficiency, absorptivity)
-    runtime_ms = (time.time() - t_start) * 1000.0
-
-    # Response: temperature_field is in Kelvin; stats are converted to Celsius here.
-    return jsonify({
-        "temperature_field": result_field.tolist(),
-        "visualization": generate_plot(result_field),
-        "fidelity_level": current_fid,
-        "fidelity_name": ["Low (LF)", "Medium (MF)", "High (HF)"][current_fid],
-        "ml_confidence": round(0.98 - (current_fid * 0.05), 4),
-        "energy_residuals": [1e-3, 1e-5, 1e-8][current_fid],
-        "timestamp": state_manager.time,
-        "stats": {
-            # All temperature values converted to Celsius for frontend display
-            "max_t":      round(float(np.max(result_field)) - 273.15, 2),
-            "min_t":      round(float(np.min(result_field)) - 273.15, 2),
-            "avg_t":      round(float(np.mean(result_field)) - 273.15, 2),
-            "power_total": round(power_total, 2),
-            "eff_avg":    round(eff_avg * 100, 2),
-            "runtime_ms": round(runtime_ms, 1)
-        }
-    })
-
-
-@app.route('/api/simulate/bte-ns', methods=['POST', 'OPTIONS'])
-def handle_bte_ns_simulation():
-    """
-    BTE-NS Coupled Simulation endpoint
-    Integrates Boltzmann Transport Equation + Navier-Stokes + Thermal
-    """
-    if request.method == 'OPTIONS':
-        return '', 204
-    
-    t_start = time.time()
-    
-    try:
-        data = request.json or {}
-        
-        # Validate and extract parameters
-        raw_fidelity = data.get('fidelity_level')
-        fidelity_level = int(raw_fidelity) if raw_fidelity is not None else 1
-        
-        # Physics parameters
-        solar_irradiance = float(np.clip(
-            float(data.get('solar_irradiance', 1000.0)), 
-            800.0, 1200.0
-        ))
-        
-        ambient_temperature = float(np.clip(
-            float(data.get('ambient_temperature', 298.15)),
-            280.0, 330.0
-        ))
-        
-        wind_speed = float(np.clip(
-            float(data.get('wind_speed', 2.0)),
-            0.0, 10.0
-        ))
-        
-        cell_efficiency = float(np.clip(
-            float(data.get('cell_efficiency', 0.20)),
-            0.10, 0.30
-        ))
-        
-        thermal_conductivity = float(np.clip(
-            float(data.get('thermal_conductivity', 130.0)),
-            100.0, 200.0
-        ))
-        
-        absorptivity = float(np.clip(
-            float(data.get('absorptivity', 0.95)),
-            0.85, 0.98
-        ))
-        
-        emissivity = float(np.clip(
-            float(data.get('emissivity', 0.90)),
-            0.80, 0.95
-        ))
-        
-        # Optional configuration
-        config = data.get('config', {})
-        
-        logger.info(f"Starting BTE-NS simulation: fidelity={fidelity_level}, "
-                   f"irradiance={solar_irradiance} W/m²")
-        
-        # Run coupled solver
-        results = coupled_solver.solve(
-            fidelity_level=fidelity_level,
-            solar_irradiance=solar_irradiance,
-            ambient_temperature=ambient_temperature,
-            wind_speed=wind_speed,
-            cell_efficiency=cell_efficiency,
-            thermal_conductivity=thermal_conductivity,
-            absorptivity=absorptivity,
-            emissivity=emissivity,
-            config=config
-        )
-        
-        # Generate visualizations
-        visualizations = {
-            'temperature_heatmap': visualizer.generate_temperature_heatmap(
-                results['temperature_field']
-            ),
-            'current_density': visualizer.generate_current_density_plot(
-                results['bte_results']['J_total']
-            ),
-            'velocity_field': visualizer.generate_velocity_field_plot(
-                results['ns_results']['u'],
-                results['ns_results']['v']
-            )
-        }
-        
-        runtime_ms = (time.time() - t_start) * 1000.0
-        
-        # Prepare response with statistics
-        response_data = {
-            "success": True,
-            "fidelity_level": fidelity_level,
-            "fidelity_name": ["Low (LF)", "Medium (MF)", "High (HF)"][fidelity_level],
-            "runtime_ms": round(runtime_ms, 1),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "statistics": {
-                # Convert temperatures to Celsius
-                "temp_max": round(results['statistics']['temp_max'] - 273.15, 2),
-                "temp_min": round(results['statistics']['temp_min'] - 273.15, 2),
-                "temp_avg": round(results['statistics']['temp_avg'] - 273.15, 2),
-                "power_total": round(results['statistics']['power_total'], 2),
-                "efficiency_avg": round(results['statistics']['efficiency_avg'] * 100, 2),
-                "current_density_max": round(results['statistics']['current_density_max'], 2),
-                "velocity_max": round(results['statistics']['velocity_max'], 2),
-                "carrier_density_avg": f"{results['statistics']['carrier_density_avg']:.2e}"
-            },
-            "visualizations": visualizations,
-            "data": {
-                "temperature_field": results['temperature_field'].tolist(),
-                "velocity_magnitude": results['ns_results']['velocity_magnitude'].tolist()
-            }
-        }
-        
-        logger.info(f"BTE-NS simulation completed in {runtime_ms:.1f}ms")
-        
-        return jsonify(response_data)
-        
-    except ValueError as e:
-        logger.error(f"Parameter validation error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Invalid parameter: {str(e)}"
-        }), 400
-        
-    except Exception as e:
-        logger.error(f"Simulation error: {str(e)}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": "Internal simulation error",
-            "details": str(e)
-        }), 500
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Contact Form
@@ -291,6 +96,31 @@ def handle_contact():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Error Logging
+# ──────────────────────────────────────────────────────────────────────
+
+@app.route('/api/log-error', methods=['POST', 'OPTIONS'])
+def handle_error_log():
+    """Frontend error telemetry endpoint"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        data = request.json or {}
+        error = data.get('error', 'Unknown error')
+        context = data.get('context', {})
+        timestamp = data.get('timestamp', datetime.now().isoformat())
+        
+        logger.error(f"Frontend error [{timestamp}]: {error} | Context: {context}")
+        
+        return jsonify({"message": "Error logged"}), 200
+    except Exception as e:
+        logger.error(f"Failed to log frontend error: {str(e)}")
+        # Always return 200 for telemetry endpoints
+        return jsonify({"message": "Error logged"}), 200
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Health Check
 # ──────────────────────────────────────────────────────────────────────
 
@@ -300,12 +130,11 @@ def health():
         return '', 204
     return jsonify({
         "status": "active",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "timestamp": datetime.now().isoformat(),
         "endpoints": {
-            "thermal": "/api/simulate",
-            "coupled": "/api/simulate/bte-ns",
-            "contact": "/api/contact"
+            "contact": "/api/contact",
+            "health": "/api/health"
         }
     })
 
@@ -325,51 +154,76 @@ def docs():
             h1 { color: #667eea; }
             .status { background: #e8f5e9; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #4CAF50; }
             .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; font-family: monospace; }
-            .new { background: #e3f2fd; border-left: 4px solid #2196F3; }
+            .info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #2196F3; }
             a { color: #667eea; text-decoration: none; }
         </style></head>
         <body><div class="container">
             <h1>🚀 AURA-MF Backend API</h1>
-            <div class="status">✅ Status: <strong>Running</strong><br>🕐 Uptime: {{ time }} simulation steps</div>
-            <h2>Endpoints</h2>
-            <div class="endpoint">GET /api/health – Health check</div>
-            <div class="endpoint">POST /api/contact – Contact form (via Formspree, honeypot-protected)</div>
-            <div class="endpoint">GET/POST /api/simulate – Thermal physics simulation</div>
-            <div class="endpoint new">POST /api/simulate/bte-ns – <strong>NEW:</strong> Coupled BTE-NS simulation</div>
+            <div class="status">✅ Status: <strong>Running</strong><br>📡 Mode: Communication-Only Backend (v3.0.0)</div>
             
-            <h2>BTE-NS Simulation</h2>
-            <p>The new <code>/api/simulate/bte-ns</code> endpoint provides:</p>
+            <div class="info">
+                <strong>Architecture Update:</strong> Physics simulation now runs entirely client-side in JavaScript. 
+                This backend provides communication and logging services only.
+            </div>
+            
+            <h2>Available Endpoints</h2>
+            <div class="endpoint">GET /api/health – Health check and status</div>
+            <div class="endpoint">POST /api/contact – Contact form submission (via Formspree, honeypot-protected)</div>
+            <div class="endpoint">POST /api/log-error – Frontend error telemetry logging</div>
+            
+            <h2>Contact Form Endpoint</h2>
+            <p>The <code>/api/contact</code> endpoint handles contact form submissions from the frontend:</p>
             <ul>
-                <li><strong>Boltzmann Transport Equation</strong> – Electron/hole carrier transport</li>
-                <li><strong>Navier-Stokes</strong> – Air flow and convective cooling</li>
-                <li><strong>Thermal Coupling</strong> – Multi-physics integration</li>
-                <li><strong>Advanced Visualizations</strong> – Temperature, current density, velocity fields</li>
+                <li><strong>Method:</strong> POST</li>
+                <li><strong>Content-Type:</strong> application/json</li>
+                <li><strong>Honeypot Protection:</strong> Server-side filtering enabled</li>
+                <li><strong>Provider:</strong> Formspree integration</li>
             </ul>
             
             <h3>Example Request:</h3>
             <pre style="background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto;">
 {
-  "fidelity_level": 1,
-  "solar_irradiance": 1000.0,
-  "ambient_temperature": 298.15,
-  "wind_speed": 2.0,
-  "cell_efficiency": 0.20,
-  "thermal_conductivity": 130.0,
-  "absorptivity": 0.95,
-  "emissivity": 0.90
+  "name": "John Doe",
+  "email": "john@example.com",
+  "message": "Hello, I have a question...",
+  "website_hp": ""
 }
             </pre>
             
-            <h3>Response includes:</h3>
+            <h2>Error Logging Endpoint</h2>
+            <p>The <code>/api/log-error</code> endpoint accepts error telemetry from the frontend:</p>
             <ul>
-                <li>Temperature distribution</li>
-                <li>Current density fields</li>
-                <li>Velocity/pressure fields</li>
-                <li>Power output & efficiency</li>
-                <li>Base64-encoded visualizations</li>
+                <li><strong>Method:</strong> POST</li>
+                <li><strong>Content-Type:</strong> application/json</li>
+                <li><strong>Purpose:</strong> Server-side logging of frontend errors</li>
             </ul>
+            
+            <h3>Example Request:</h3>
+            <pre style="background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto;">
+{
+  "error": "TypeError: Cannot read property 'x' of undefined",
+  "context": {
+    "component": "SimulationEngine",
+    "userAgent": "Mozilla/5.0..."
+  },
+  "timestamp": "2026-02-08T01:48:00.000Z"
+}
+            </pre>
+            
+            <h2>Health Check Response</h2>
+            <pre style="background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto;">
+{
+  "status": "active",
+  "version": "3.0.0",
+  "timestamp": "2026-02-08T01:48:00.000000",
+  "endpoints": {
+    "contact": "/api/contact",
+    "health": "/api/health"
+  }
+}
+            </pre>
         </div></body></html>
-    """, time=state_manager.time)
+    """)
 
 
 # ──────────────────────────────────────────────────────────────────────
